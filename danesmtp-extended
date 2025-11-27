@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# danesmtp - DANE SMTP tester with signature selection
+# Supports: MX lookup, multi-IP, -a IP override, -s rsa/ecdsa, -sigalgs
+
+set -euo pipefail
+
+danesmtp_single() {
+    local addr="$1"
+    local host="$2"
+    shift 2
+    local extra_opts=("$@")
+
+    echo ""
+    echo "=== Testing $host via $addr:25 ==="
+
+    # Map -s rsa / ecdsa to openssl sigalgs
+    local sigalgs_opt=()
+    if [[ -n "${SIGALGS:-}" ]]; then
+        sigalgs_opt=(-sigalgs "$SIGALGS")
+    fi
+
+    # Base openssl s_client options
+    local sslopts=(
+        -starttls smtp
+        -connect "$addr:25"
+        -verify 9
+        -verify_return_error
+        -dane_ee_no_namechecks
+        -dane_tlsa_domain "$host"
+        "${sigalgs_opt[@]}"
+    )
+
+    # Fetch TLSA records
+    mapfile -t rrs < <(
+        dig +short +nosplit -t tlsa "_25._tcp.$host" |
+        grep -Ei '^[23] [01] [012] [0-9a-f]+$' || true
+    )
+
+    if (( ${#rrs[@]} == 0 )); then
+        echo "  [!] WARNING: No TLSA records found for _25._tcp.$host"
+    fi
+
+    for rr in "${rrs[@]}"; do
+        sslopts+=(-dane_tlsa_rrdata "$rr")
+    done
+
+    # Run OpenSSL with brief info
+    ( sleep 1; printf "QUIT\r\n" ) \
+        | openssl s_client -brief "${sslopts[@]}" "${extra_opts[@]}" \
+        || echo "  [!] FAILED for $addr"
+}
+
+danesmtp() {
+    local OPTIND=1 opt
+    local forced_addr=
+    SIGALGS=
+    local host=
+
+    # Parse options
+    while getopts a:s: opt; do
+        case $opt in
+            a) forced_addr=$OPTARG
+               [[ $forced_addr == *:* ]] && forced_addr="[$forced_addr]"
+               ;;
+            s)
+               case "$OPTARG" in
+                   rsa) SIGALGS="rsa_pss_rsae_sha256:rsa_pkcs1_sha256" ;;
+                   ecdsa) SIGALGS="ecdsa_secp256r1_sha256" ;;
+                   *) SIGALGS="$OPTARG" ;;
+               esac
+               ;;
+            *)
+               echo "Usage: danesmtp [-a addr] [-s rsa|ecdsa|<sigalg>] domain [openssl opts...]"
+               return 1 ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # Host argument is required
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: danesmtp [-a addr] [-s rsa|ecdsa|<sigalg>] domain [openssl opts...]"
+        return 1
+    fi
+    host="$1"
+    shift
+
+    # If -a given → test only that address
+    if [[ -n "$forced_addr" ]]; then
+        danesmtp_single "$forced_addr" "$host" "$@"
+        return
+    fi
+
+    echo "Looking up MX for $host..."
+    mapfile -t mxhosts < <(
+        dig +short mx "$host" | awk '{print $2}' | sed 's/\.$//'
+    )
+
+    if (( ${#mxhosts[@]} == 0 )); then
+        echo "  [!] No MX records found — testing host directly"
+        mxhosts=("$host")
+    fi
+
+    for mx in "${mxhosts[@]}"; do
+        echo ""
+        echo "=== MX: $mx ==="
+
+        # Resolve all IPv4 + IPv6 addresses
+        mapfile -t addrs < <(
+            {
+                dig +short a     "$mx"
+                dig +short aaaa  "$mx"
+            } | sed '/^$/d'
+        )
+
+        if (( ${#addrs[@]} == 0 )); then
+            echo "  [!] No A/AAAA records for $mx"
+            continue
+        fi
+
+        for addr in "${addrs[@]}"; do
+            [[ $addr == *:* ]] && addr="[$addr]"
+            danesmtp_single "$addr" "$mx" "$@"
+        done
+    done
+}
+
+# entry point
+danesmtp "$@"
